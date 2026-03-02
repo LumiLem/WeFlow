@@ -228,6 +228,7 @@ const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 const EXPORT_AVATAR_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+const EXPORT_AVATAR_ENRICH_BATCH_SIZE = 80
 type SessionDataSource = 'cache' | 'network' | null
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
@@ -482,25 +483,74 @@ function ExportPage() {
       'default'
     ].filter(Boolean)))
 
+    type CacheCandidate = {
+      scopeKey: string
+      contactsItem: configService.ContactsListCacheItem | null
+      avatarItem: configService.ContactsAvatarCacheItem | null
+      contactsCount: number
+      avatarCount: number
+      contactsUpdatedAt: number
+      avatarUpdatedAt: number
+    }
+
+    const candidatesWithData: CacheCandidate[] = []
     for (const candidate of candidates) {
       const [contactsItem, avatarItem] = await Promise.all([
         configService.getContactsListCache(candidate),
         configService.getContactsAvatarCache(candidate)
       ])
-      const hasContacts = Boolean(contactsItem?.contacts?.length)
-      const hasAvatars = Boolean(avatarItem && Object.keys(avatarItem.avatars || {}).length > 0)
-      if (!hasContacts && !hasAvatars) continue
-      return {
-        resolvedScopeKey: candidate,
+      const contactsCount = contactsItem?.contacts?.length || 0
+      const avatarCount = avatarItem ? Object.keys(avatarItem.avatars || {}).length : 0
+      if (contactsCount === 0 && avatarCount === 0) continue
+      candidatesWithData.push({
+        scopeKey: candidate,
         contactsItem,
-        avatarItem
+        avatarItem,
+        contactsCount,
+        avatarCount,
+        contactsUpdatedAt: contactsItem?.updatedAt || 0,
+        avatarUpdatedAt: avatarItem?.updatedAt || 0
+      })
+    }
+
+    if (candidatesWithData.length === 0) {
+      return {
+        resolvedContactsScopeKey: primaryScopeKey,
+        resolvedAvatarScopeKeys: [] as string[],
+        contactsItem: null as configService.ContactsListCacheItem | null,
+        avatarItem: null as configService.ContactsAvatarCacheItem | null
       }
     }
 
+    const bestContactsCandidate = candidatesWithData
+      .filter(item => item.contactsCount > 0)
+      .sort((a, b) => {
+        if (b.contactsCount !== a.contactsCount) return b.contactsCount - a.contactsCount
+        if (b.contactsUpdatedAt !== a.contactsUpdatedAt) return b.contactsUpdatedAt - a.contactsUpdatedAt
+        return b.avatarCount - a.avatarCount
+      })[0]
+
+    const avatarCandidates = candidatesWithData
+      .filter(item => item.avatarCount > 0)
+      .sort((a, b) => a.avatarUpdatedAt - b.avatarUpdatedAt)
+    const mergedAvatarEntries: Record<string, configService.ContactsAvatarCacheEntry> = {}
+    for (const candidate of avatarCandidates) {
+      Object.assign(mergedAvatarEntries, candidate.avatarItem?.avatars || {})
+    }
+    const mergedAvatarUpdatedAt = avatarCandidates.reduce((max, candidate) => (
+      candidate.avatarUpdatedAt > max ? candidate.avatarUpdatedAt : max
+    ), 0)
+
     return {
-      resolvedScopeKey: primaryScopeKey,
-      contactsItem: null as configService.ContactsListCacheItem | null,
-      avatarItem: null as configService.ContactsAvatarCacheItem | null
+      resolvedContactsScopeKey: bestContactsCandidate?.scopeKey || primaryScopeKey,
+      resolvedAvatarScopeKeys: avatarCandidates.map(candidate => candidate.scopeKey),
+      contactsItem: bestContactsCandidate?.contactsItem || null,
+      avatarItem: Object.keys(mergedAvatarEntries).length > 0
+        ? {
+            updatedAt: mergedAvatarUpdatedAt,
+            avatars: mergedAvatarEntries
+          }
+        : null
     }
   }, [])
 
@@ -650,7 +700,8 @@ function ExportPage() {
       if (isStale()) return
 
       const {
-        resolvedScopeKey,
+        resolvedContactsScopeKey,
+        resolvedAvatarScopeKeys,
         contactsItem: cachedContactsItem,
         avatarItem: cachedAvatarItem
       } = await loadContactsCachesWithScopeFallback(scopeKey)
@@ -668,12 +719,12 @@ function ExportPage() {
       setSessionContactsUpdatedAt(cachedContactsItem?.updatedAt || null)
       setSessionAvatarUpdatedAt(cachedAvatarItem?.updatedAt || null)
 
-      if (resolvedScopeKey !== scopeKey && cachedContacts.length > 0) {
+      if (resolvedContactsScopeKey !== scopeKey && cachedContacts.length > 0) {
         void configService.setContactsListCache(scopeKey, cachedContacts).catch((error) => {
           console.error('回填主 scope 通讯录缓存失败:', error)
         })
       }
-      if (resolvedScopeKey !== scopeKey && Object.keys(cachedAvatarEntries).length > 0) {
+      if (!resolvedAvatarScopeKeys.includes(scopeKey) && Object.keys(cachedAvatarEntries).length > 0) {
         void configService.setContactsAvatarCache(scopeKey, cachedAvatarEntries).catch((error) => {
           console.error('回填主 scope 头像缓存失败:', error)
         })
@@ -710,21 +761,19 @@ function ExportPage() {
             let hasFreshNetworkData = false
 
             if (isStale()) return
-            if (cachedContacts.length === 0) {
-              const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
-              if (isStale()) return
+            const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
+            if (isStale()) return
 
-              const contacts: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
-              if (contacts.length > 0) {
-                hasFreshNetworkData = true
-                syncContactTypeCounts(contacts)
-                const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
-                  map[contact.username] = contact
-                  return map
-                }, {})
-                contactMap = nextContactMap
-                setSessionContactsUpdatedAt(Date.now())
-              }
+            const contacts: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
+            if (contacts.length > 0) {
+              hasFreshNetworkData = true
+              syncContactTypeCounts(contacts)
+              const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
+                map[contact.username] = contact
+                return map
+              }, {})
+              contactMap = nextContactMap
+              setSessionContactsUpdatedAt(Date.now())
             }
 
             const now = Date.now()
@@ -741,14 +790,27 @@ function ExportPage() {
 
             let extraContactMap: Record<string, { displayName?: string; avatarUrl?: string }> = {}
             if (needsEnrichment.length > 0) {
-              if (isStale()) return
-              const enrichResult = await withTimeout(
-                window.electronAPI.chat.enrichSessionsContactInfo(needsEnrichment),
-                CONTACT_ENRICH_TIMEOUT_MS
-              )
-              if (enrichResult?.success && enrichResult.contacts) {
-                extraContactMap = enrichResult.contacts
-                hasFreshNetworkData = true
+              for (let i = 0; i < needsEnrichment.length; i += EXPORT_AVATAR_ENRICH_BATCH_SIZE) {
+                if (isStale()) return
+                const batch = needsEnrichment.slice(i, i + EXPORT_AVATAR_ENRICH_BATCH_SIZE)
+                if (batch.length === 0) continue
+                try {
+                  const enrichResult = await withTimeout(
+                    window.electronAPI.chat.enrichSessionsContactInfo(batch),
+                    CONTACT_ENRICH_TIMEOUT_MS
+                  )
+                  if (isStale()) return
+                  if (enrichResult?.success && enrichResult.contacts) {
+                    extraContactMap = {
+                      ...extraContactMap,
+                      ...enrichResult.contacts
+                    }
+                    hasFreshNetworkData = true
+                  }
+                } catch (batchError) {
+                  console.error('导出页分批补充会话联系人信息失败:', batchError)
+                }
+                await new Promise(resolve => setTimeout(resolve, 0))
               }
             }
 
@@ -824,8 +886,10 @@ function ExportPage() {
               await configService.setContactsListCache(scopeKey, contactsCachePayload)
               setSessionContactsUpdatedAt(persistAt)
             }
-            await configService.setContactsAvatarCache(scopeKey, avatarEntries)
-            setSessionAvatarUpdatedAt(persistAt)
+            if (Object.keys(avatarEntries).length > 0) {
+              await configService.setContactsAvatarCache(scopeKey, avatarEntries)
+              setSessionAvatarUpdatedAt(persistAt)
+            }
             if (hasFreshNetworkData) {
               setSessionDataSource('network')
             }
