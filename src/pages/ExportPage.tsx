@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import { useLocation } from 'react-router-dom'
 import { TableVirtuoso } from 'react-virtuoso'
+import { createPortal } from 'react-dom'
 import {
   Aperture,
   Calendar,
@@ -29,6 +30,12 @@ import {
 import type { ChatSession as AppChatSession, ContactInfo } from '../types/models'
 import type { ExportOptions as ElectronExportOptions, ExportProgress } from '../types/electron'
 import * as configService from '../services/config'
+import {
+  emitExportSessionStatus,
+  emitSingleExportDialogStatus,
+  onExportSessionStatusRequest,
+  onOpenSingleExport
+} from '../services/exportBridge'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
 import './ExportPage.scss'
 
@@ -654,6 +661,8 @@ function ExportPage() {
   const contactsAvatarCacheRef = useRef<Record<string, configService.ContactsAvatarCacheEntry>>({})
   const contactsListRef = useRef<HTMLDivElement>(null)
   const detailRequestSeqRef = useRef(0)
+  const inProgressSessionIdsRef = useRef<string[]>([])
+  const hasBaseConfigReadyRef = useRef(false)
 
   const ensureExportCacheScope = useCallback(async (): Promise<string> => {
     if (exportCacheScopeReadyRef.current) {
@@ -1033,8 +1042,9 @@ function ExportPage() {
     return () => clearInterval(timer)
   }, [isExportRoute])
 
-  const loadBaseConfig = useCallback(async () => {
+  const loadBaseConfig = useCallback(async (): Promise<boolean> => {
     setIsBaseConfigLoading(true)
+    let isReady = true
     try {
       const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
@@ -1085,10 +1095,15 @@ function ExportPage() {
         exportConcurrency: savedConcurrency ?? prev.exportConcurrency
       }))
     } catch (error) {
+      isReady = false
       console.error('加载导出配置失败:', error)
     } finally {
       setIsBaseConfigLoading(false)
     }
+    if (isReady) {
+      hasBaseConfigReadyRef.current = true
+    }
+    return isReady
   }, [ensureExportCacheScope])
 
   const loadSnsStats = useCallback(async (options?: { full?: boolean; silent?: boolean }) => {
@@ -1475,7 +1490,7 @@ function ExportPage() {
 
   const clearSelection = () => setSelectedSessions(new Set())
 
-  const openExportDialog = (payload: Omit<ExportDialogState, 'open'>) => {
+  const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open'>) => {
     setExportDialog({ open: true, ...payload })
 
     setOptions(prev => {
@@ -1516,11 +1531,63 @@ function ExportPage() {
 
       return next
     })
-  }
+  }, [])
 
-  const closeExportDialog = () => {
+  const closeExportDialog = useCallback(() => {
     setExportDialog(prev => ({ ...prev, open: false }))
-  }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = onOpenSingleExport((payload) => {
+      void (async () => {
+        const sessionId = typeof payload?.sessionId === 'string'
+          ? payload.sessionId.trim()
+          : ''
+        if (!sessionId) return
+
+        const sessionName = typeof payload?.sessionName === 'string'
+          ? payload.sessionName.trim()
+          : ''
+        const displayName = sessionName || sessionId
+        const requestId = typeof payload?.requestId === 'string'
+          ? payload.requestId.trim()
+          : ''
+
+        const emitStatus = (
+          status: 'initializing' | 'opened' | 'failed',
+          message?: string
+        ) => {
+          if (!requestId) return
+          emitSingleExportDialogStatus({ requestId, status, message })
+        }
+
+        try {
+          if (!hasBaseConfigReadyRef.current) {
+            emitStatus('initializing')
+            const ready = await loadBaseConfig()
+            if (!ready) {
+              emitStatus('failed', '导出模块初始化失败，请重试')
+              return
+            }
+          }
+
+          setSelectedSessions(new Set([sessionId]))
+          openExportDialog({
+            scope: 'single',
+            sessionIds: [sessionId],
+            sessionNames: [displayName],
+            title: `导出会话：${displayName}`
+          })
+          emitStatus('opened')
+        } catch (error) {
+          console.error('聊天页唤起导出弹窗失败:', error)
+          emitStatus('failed', String(error))
+        }
+      })()
+    })
+
+    return unsubscribe
+  }, [loadBaseConfig, openExportDialog])
 
   const buildExportOptions = (scope: TaskScope, contentType?: ContentType): ElectronExportOptions => {
     const sessionLayout: SessionLayout = writeLayout === 'C' ? 'per-session' : 'shared'
@@ -2102,6 +2169,41 @@ function ExportPage() {
     }
     return set
   }, [tasks])
+
+  const inProgressSessionIds = useMemo(() => {
+    const set = new Set<string>()
+    for (const task of tasks) {
+      if (task.status !== 'running' && task.status !== 'queued') continue
+      for (const id of task.payload.sessionIds) {
+        set.add(id)
+      }
+    }
+    return Array.from(set).sort()
+  }, [tasks])
+
+  const inProgressSessionIdsKey = useMemo(
+    () => inProgressSessionIds.join('||'),
+    [inProgressSessionIds]
+  )
+
+  useEffect(() => {
+    inProgressSessionIdsRef.current = inProgressSessionIds
+  }, [inProgressSessionIds])
+
+  useEffect(() => {
+    emitExportSessionStatus({
+      inProgressSessionIds: inProgressSessionIdsRef.current
+    })
+  }, [inProgressSessionIdsKey])
+
+  useEffect(() => {
+    const unsubscribe = onExportSessionStatusRequest(() => {
+      emitExportSessionStatus({
+        inProgressSessionIds: inProgressSessionIdsRef.current
+      })
+    })
+    return unsubscribe
+  }, [])
 
   const runningCardTypes = useMemo(() => {
     const set = new Set<ContentCardType>()
@@ -3223,7 +3325,7 @@ function ExportPage() {
         </div>
       </div>
 
-      {exportDialog.open && (
+      {exportDialog.open && createPortal(
         <div className="export-dialog-overlay" onClick={closeExportDialog}>
           <div className="export-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
             <div className="dialog-header">
@@ -3365,7 +3467,8 @@ function ExportPage() {
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   )

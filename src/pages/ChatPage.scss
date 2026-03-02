@@ -534,6 +534,22 @@
         overflow: hidden;
       }
 
+      .export-prepare-hint {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 24px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        border-bottom: 1px solid var(--border-color);
+        background: var(--bg-tertiary);
+        -webkit-app-region: no-drag;
+
+        .spin {
+          animation: spin 1s linear infinite;
+        }
+      }
+
       .message-list {
         flex: 1;
         background: var(--chat-pattern);
@@ -1642,6 +1658,10 @@
       opacity: 0.5;
       cursor: not-allowed;
     }
+
+    .spin {
+      animation: spin 1s linear infinite;
+    }
   }
 }
 
@@ -1680,6 +1700,21 @@
   &.switching .loading-overlay {
     background: rgba(127, 127, 127, 0.18);
     backdrop-filter: blur(4px);
+  }
+}
+
+.export-prepare-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+
+  .spin {
+    animation: spin 1s linear infinite;
   }
 }
 

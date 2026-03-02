@@ -12,6 +12,12 @@ import { LivePhotoIcon } from '../components/LivePhotoIcon'
 import { AnimatedStreamingText } from '../components/AnimatedStreamingText'
 import JumpToDateDialog from '../components/JumpToDateDialog'
 import * as configService from '../services/config'
+import {
+  emitOpenSingleExport,
+  onExportSessionStatus,
+  onSingleExportDialogStatus,
+  requestExportSessionStatus
+} from '../services/exportBridge'
 import './ChatPage.scss'
 
 // 系统消息类型常量
@@ -385,6 +391,9 @@ function ChatPage(_props: ChatPageProps) {
   const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(null)
   const [showVoiceTranscribeDialog, setShowVoiceTranscribeDialog] = useState(false)
   const [pendingVoiceTranscriptRequest, setPendingVoiceTranscriptRequest] = useState<{ sessionId: string; messageId: string } | null>(null)
+  const [inProgressExportSessionIds, setInProgressExportSessionIds] = useState<Set<string>>(new Set())
+  const [isPreparingExportDialog, setIsPreparingExportDialog] = useState(false)
+  const [exportPrepareHint, setExportPrepareHint] = useState('')
 
   // 消息右键菜单
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: Message } | null>(null)
@@ -454,6 +463,85 @@ function ChatPage(_props: ChatPageProps) {
   const previewCacheRef = useRef<Record<string, SessionPreviewCacheEntry>>({})
   const previewPersistTimerRef = useRef<number | null>(null)
   const sessionListPersistTimerRef = useRef<number | null>(null)
+  const pendingExportRequestIdRef = useRef<string | null>(null)
+  const exportPrepareLongWaitTimerRef = useRef<number | null>(null)
+
+  const clearExportPrepareState = useCallback(() => {
+    pendingExportRequestIdRef.current = null
+    setIsPreparingExportDialog(false)
+    setExportPrepareHint('')
+    if (exportPrepareLongWaitTimerRef.current) {
+      window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+      exportPrepareLongWaitTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = onExportSessionStatus((payload) => {
+      const ids = Array.isArray(payload?.inProgressSessionIds)
+        ? payload.inProgressSessionIds
+          .filter((id): id is string => typeof id === 'string')
+          .map(id => id.trim())
+          .filter(Boolean)
+        : []
+      setInProgressExportSessionIds(new Set(ids))
+    })
+
+    requestExportSessionStatus()
+    const timer = window.setTimeout(() => {
+      requestExportSessionStatus()
+    }, 0)
+    return () => {
+      window.clearTimeout(timer)
+      unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = onSingleExportDialogStatus((payload) => {
+      const requestId = typeof payload?.requestId === 'string' ? payload.requestId.trim() : ''
+      if (!requestId || requestId !== pendingExportRequestIdRef.current) return
+
+      if (payload.status === 'initializing') {
+        setExportPrepareHint('正在准备导出模块（首次会稍慢，通常 1-3 秒）')
+        if (exportPrepareLongWaitTimerRef.current) {
+          window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+        }
+        exportPrepareLongWaitTimerRef.current = window.setTimeout(() => {
+          if (pendingExportRequestIdRef.current !== requestId) return
+          setExportPrepareHint('仍在准备导出模块，请稍候...')
+        }, 8000)
+        return
+      }
+
+      if (payload.status === 'opened') {
+        clearExportPrepareState()
+        return
+      }
+
+      if (payload.status === 'failed') {
+        const message = (typeof payload.message === 'string' && payload.message.trim())
+          ? payload.message.trim()
+          : '导出模块初始化失败，请重试'
+        clearExportPrepareState()
+        window.alert(message)
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      if (exportPrepareLongWaitTimerRef.current) {
+        window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+        exportPrepareLongWaitTimerRef.current = null
+      }
+    }
+  }, [clearExportPrepareState])
+
+  useEffect(() => {
+    if (!isPreparingExportDialog || !currentSessionId) return
+    if (!inProgressExportSessionIds.has(currentSessionId)) return
+    clearExportPrepareState()
+  }, [clearExportPrepareState, currentSessionId, inProgressExportSessionIds, isPreparingExportDialog])
 
   // 加载当前用户头像
   const loadMyAvatar = useCallback(async () => {
@@ -1844,6 +1932,8 @@ function ChatPage(_props: ChatPageProps) {
       displayName: fallbackDisplayName || currentSessionId,
     } as ChatSession
   })()
+  const isCurrentSessionExporting = Boolean(currentSessionId && inProgressExportSessionIds.has(currentSessionId))
+  const isExportActionBusy = isCurrentSessionExporting || isPreparingExportDialog
 
   // 从通讯录跳转时，会话不在列表中，主动加载联系人显示名称
   useEffect(() => {
@@ -1960,12 +2050,23 @@ function ChatPage(_props: ChatPageProps) {
 
   const handleExportCurrentSession = useCallback(() => {
     if (!currentSessionId) return
-    navigate('/export', {
-      state: {
-        preselectSessionIds: [currentSessionId]
-      }
+    if (inProgressExportSessionIds.has(currentSessionId) || isPreparingExportDialog) return
+
+    const requestId = `chat-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const sessionName = currentSession?.displayName || currentSession?.username || currentSessionId
+    pendingExportRequestIdRef.current = requestId
+    setIsPreparingExportDialog(true)
+    setExportPrepareHint('')
+    if (exportPrepareLongWaitTimerRef.current) {
+      window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+      exportPrepareLongWaitTimerRef.current = null
+    }
+    emitOpenSingleExport({
+      sessionId: currentSessionId,
+      sessionName,
+      requestId
     })
-  }, [currentSessionId, navigate])
+  }, [currentSession, currentSessionId, inProgressExportSessionIds, isPreparingExportDialog])
 
   const handleGroupAnalytics = useCallback(() => {
     if (!currentSessionId || !isGroupChat(currentSessionId)) return
@@ -2641,12 +2742,16 @@ function ChatPage(_props: ChatPageProps) {
                   </button>
                 )}
                 <button
-                  className="icon-btn export-session-btn"
+                  className={`icon-btn export-session-btn${isExportActionBusy ? ' exporting' : ''}`}
                   onClick={handleExportCurrentSession}
-                  disabled={!currentSessionId}
-                  title="导出当前会话"
+                  disabled={!currentSessionId || isExportActionBusy}
+                  title={isCurrentSessionExporting ? '导出中' : isPreparingExportDialog ? '正在准备导出模块' : '导出当前会话'}
                 >
-                  <Download size={18} />
+                  {isExportActionBusy ? (
+                    <Loader2 size={18} className="spin" />
+                  ) : (
+                    <Download size={18} />
+                  )}
                 </button>
                 <button
                   className={`icon-btn batch-transcribe-btn${isBatchTranscribing ? ' transcribing' : ''}`}
@@ -2750,6 +2855,13 @@ function ChatPage(_props: ChatPageProps) {
                 </button>
               </div>
             </div>
+
+            {isPreparingExportDialog && exportPrepareHint && (
+              <div className="export-prepare-hint" role="status" aria-live="polite">
+                <Loader2 size={14} className="spin" />
+                <span>{exportPrepareHint}</span>
+              </div>
+            )}
 
             <div className={`message-content-wrapper ${hasInitialMessages ? 'loaded' : 'loading'} ${isSessionSwitching ? 'switching' : ''}`}>
               {isLoadingMessages && (!hasInitialMessages || isSessionSwitching) && (

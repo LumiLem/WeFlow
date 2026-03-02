@@ -63,7 +63,6 @@ function App() {
   const isNotificationWindow = location.pathname === '/notification-window'
   const isExportRoute = location.pathname === '/export'
   const [themeHydrated, setThemeHydrated] = useState(false)
-  const [hasVisitedExport, setHasVisitedExport] = useState(isExportRoute)
 
   // 锁定状态
   // const [isLocked, setIsLocked] = useState(false) // Moved to store
@@ -100,12 +99,6 @@ function App() {
       }
     }
   }, [isOnboardingWindow])
-
-  useEffect(() => {
-    if (isExportRoute) {
-      setHasVisitedExport(true)
-    }
-  }, [isExportRoute])
 
   // 应用主题
   useEffect(() => {
@@ -462,11 +455,9 @@ function App() {
         <Sidebar />
         <main className="content">
           <RouteGuard>
-            {hasVisitedExport && (
-              <div className={`export-keepalive-page ${isExportRoute ? 'active' : 'hidden'}`} aria-hidden={!isExportRoute}>
-                <ExportPage />
-              </div>
-            )}
+            <div className={`export-keepalive-page ${isExportRoute ? 'active' : 'hidden'}`} aria-hidden={!isExportRoute}>
+              <ExportPage />
+            </div>
 
             <Routes>
               <Route path="/" element={<HomePage />} />
