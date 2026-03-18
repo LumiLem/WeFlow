@@ -511,6 +511,48 @@ export class WcdbCore {
     return ''
   }
 
+  private escapeSqlString(value: string): string {
+    return String(value || '').replace(/'/g, "''")
+  }
+
+  private buildContactSelectSql(usernames: string[] = []): string {
+    const uniq = Array.from(new Set((usernames || []).map((item) => String(item || '').trim()).filter(Boolean)))
+    if (uniq.length === 0) return 'SELECT * FROM contact'
+    const inList = uniq.map((username) => `'${this.escapeSqlString(username)}'`).join(',')
+    return `SELECT * FROM contact WHERE username IN (${inList})`
+  }
+
+  private deriveContactTypeCounts(rows: Array<Record<string, any>>): { private: number; group: number; official: number; former_friend: number } {
+    const counts = {
+      private: 0,
+      group: 0,
+      official: 0,
+      former_friend: 0
+    }
+    const excludeNames = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
+
+    for (const row of rows || []) {
+      const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
+      if (!username) continue
+
+      const localTypeRaw = row.local_type ?? row.localType ?? row.WCDB_CT_local_type ?? 0
+      const localType = Number.isFinite(Number(localTypeRaw)) ? Math.floor(Number(localTypeRaw)) : 0
+      const quanPin = this.pickFirstStringField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin'])
+
+      if (username.endsWith('@chatroom')) {
+        counts.group += 1
+      } else if (username.startsWith('gh_')) {
+        counts.official += 1
+      } else if (localType === 1 && !excludeNames.has(username)) {
+        counts.private += 1
+      } else if (localType === 0 && quanPin) {
+        counts.former_friend += 1
+      }
+    }
+
+    return counts
+  }
+
   /**
    * 初始化 WCDB
    */
@@ -2098,13 +2140,23 @@ export class WcdbCore {
 
   async getContactTypeCounts(): Promise<{ success: boolean; counts?: { private: number; group: number; official: number; former_friend: number }; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbGetContactTypeCounts) return { success: false, error: '接口未就绪' }
+    const runFallback = async (reason: string) => {
+      const contactsResult = await this.getContactsCompact()
+      if (!contactsResult.success || !Array.isArray(contactsResult.contacts)) {
+        return { success: false, error: `获取联系人分类统计失败: ${reason}; fallback=${contactsResult.error || 'unknown'}` }
+      }
+      const counts = this.deriveContactTypeCounts(contactsResult.contacts as Array<Record<string, any>>)
+      this.writeLog(`[diag:getContactTypeCounts] fallback reason=${reason} private=${counts.private} group=${counts.group} official=${counts.official} former_friend=${counts.former_friend}`, true)
+      return { success: true, counts }
+    }
+
+    if (!this.wcdbGetContactTypeCounts) return await runFallback('api_missing')
     try {
       const outPtr = [null as any]
       const code = this.wcdbGetContactTypeCounts(this.handle, outPtr)
-      if (code !== 0 || !outPtr[0]) return { success: false, error: `获取联系人分类统计失败: ${code}` }
+      if (code !== 0 || !outPtr[0]) return await runFallback(`code=${code}`)
       const jsonStr = this.decodeJsonPtr(outPtr[0])
-      if (!jsonStr) return { success: false, error: '解析联系人分类统计失败' }
+      if (!jsonStr) return await runFallback('decode_empty')
       const raw = JSON.parse(jsonStr) || {}
       return {
         success: true,
@@ -2116,24 +2168,34 @@ export class WcdbCore {
         }
       }
     } catch (e) {
-      return { success: false, error: String(e) }
+      return await runFallback(`exception=${String(e)}`)
     }
   }
 
   async getContactsCompact(usernames: string[] = []): Promise<{ success: boolean; contacts?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbGetContactsCompact) return { success: false, error: '接口未就绪' }
+    const runFallback = async (reason: string) => {
+      const fallback = await this.execQuery('contact', null, this.buildContactSelectSql(usernames))
+      if (!fallback.success) {
+        return { success: false, error: `获取联系人列表失败: ${reason}; fallback=${fallback.error || 'unknown'}` }
+      }
+      const rows = Array.isArray(fallback.rows) ? fallback.rows : []
+      this.writeLog(`[diag:getContactsCompact] fallback reason=${reason} usernames=${Array.isArray(usernames) ? usernames.length : 0} rows=${rows.length}`, true)
+      return { success: true, contacts: rows }
+    }
+
+    if (!this.wcdbGetContactsCompact) return await runFallback('api_missing')
     try {
       const outPtr = [null as any]
       const payload = Array.isArray(usernames) && usernames.length > 0 ? JSON.stringify(usernames) : null
       const code = this.wcdbGetContactsCompact(this.handle, payload, outPtr)
-      if (code !== 0 || !outPtr[0]) return { success: false, error: `获取联系人列表失败: ${code}` }
+      if (code !== 0 || !outPtr[0]) return await runFallback(`code=${code}`)
       const jsonStr = this.decodeJsonPtr(outPtr[0])
-      if (!jsonStr) return { success: false, error: '解析联系人列表失败' }
+      if (!jsonStr) return await runFallback('decode_empty')
       const contacts = JSON.parse(jsonStr)
       return { success: true, contacts: Array.isArray(contacts) ? contacts : [] }
     } catch (e) {
-      return { success: false, error: String(e) }
+      return await runFallback(`exception=${String(e)}`)
     }
   }
 
