@@ -1291,9 +1291,26 @@ const TaskCenterModal = memo(function TaskCenterModal({
                 )
                 const exportedMessages = Math.max(0, Math.floor(task.progress.exportedMessages || 0))
                 const estimatedTotalMessages = Math.max(0, Math.floor(task.progress.estimatedTotalMessages || 0))
+                const collectedMessages = Math.max(0, Math.floor(task.progress.collectedMessages || 0))
                 const messageProgressLabel = estimatedTotalMessages > 0
                   ? `已导出 ${Math.min(exportedMessages, estimatedTotalMessages)}/${estimatedTotalMessages} 条`
                   : `已导出 ${exportedMessages} 条`
+                const effectiveMessageProgressLabel = (
+                  exportedMessages > 0 || estimatedTotalMessages > 0 || collectedMessages <= 0 || task.progress.phase !== 'preparing'
+                )
+                  ? messageProgressLabel
+                  : `已收集 ${collectedMessages.toLocaleString()} 条`
+                const phaseProgress = Math.max(0, Math.floor(task.progress.phaseProgress || 0))
+                const phaseTotal = Math.max(0, Math.floor(task.progress.phaseTotal || 0))
+                const phaseMetricLabel = phaseTotal > 0
+                  ? (
+                    task.progress.phase === 'exporting-media'
+                      ? `媒体 ${Math.min(phaseProgress, phaseTotal)}/${phaseTotal}`
+                      : task.progress.phase === 'exporting-voice'
+                        ? `语音 ${Math.min(phaseProgress, phaseTotal)}/${phaseTotal}`
+                        : ''
+                  )
+                  : ''
                 const sessionProgressLabel = completedSessionTotal > 0
                   ? `会话 ${completedSessionCount}/${completedSessionTotal}`
                   : '会话处理中'
@@ -1317,7 +1334,8 @@ const TaskCenterModal = memo(function TaskCenterModal({
                             />
                           </div>
                           <div className="task-progress-text">
-                            {`${sessionProgressLabel} · ${messageProgressLabel}`}
+                            {`${sessionProgressLabel} · ${effectiveMessageProgressLabel}`}
+                            {phaseMetricLabel ? ` · ${phaseMetricLabel}` : ''}
                             {task.status === 'running' && currentSessionRatio !== null
                               ? `（当前会话 ${Math.round(currentSessionRatio * 100)}%）`
                               : ''}

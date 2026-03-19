@@ -421,6 +421,34 @@ class ExportService {
     }
   }
 
+  private isCloneUnsupportedError(code: string | undefined): boolean {
+    return code === 'ENOTSUP' || code === 'ENOSYS' || code === 'EINVAL' || code === 'EXDEV' || code === 'ENOTTY'
+  }
+
+  private async copyFileOptimized(sourcePath: string, destPath: string): Promise<{ success: boolean; code?: string }> {
+    const cloneFlag = typeof fs.constants.COPYFILE_FICLONE === 'number' ? fs.constants.COPYFILE_FICLONE : 0
+    try {
+      if (cloneFlag) {
+        await fs.promises.copyFile(sourcePath, destPath, cloneFlag)
+      } else {
+        await fs.promises.copyFile(sourcePath, destPath)
+      }
+      return { success: true }
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException | undefined)?.code
+      if (!this.isCloneUnsupportedError(code)) {
+        return { success: false, code }
+      }
+    }
+
+    try {
+      await fs.promises.copyFile(sourcePath, destPath)
+      return { success: true }
+    } catch (e) {
+      return { success: false, code: (e as NodeJS.ErrnoException | undefined)?.code }
+    }
+  }
+
   private isMediaExportEnabled(options: ExportOptions): boolean {
     return options.exportMedia === true &&
       Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
@@ -2387,14 +2415,18 @@ class ExportService {
       }
 
       // 复制文件
-      if (!(await this.pathExists(sourcePath))) {
-        console.log(`[Export] 源图片文件不存在 (localId=${msg.localId}): ${sourcePath} → 将显示 [图片] 占位符`)
-        return null
-      }
       const ext = path.extname(sourcePath) || '.jpg'
       const fileName = `${messageId}_${imageKey}${ext}`
       const destPath = path.join(imagesDir, fileName)
-      await fs.promises.copyFile(sourcePath, destPath)
+      const copied = await this.copyFileOptimized(sourcePath, destPath)
+      if (!copied.success) {
+        if (copied.code === 'ENOENT') {
+          console.log(`[Export] 源图片文件不存在 (localId=${msg.localId}): ${sourcePath} → 将显示 [图片] 占位符`)
+        } else {
+          console.log(`[Export] 复制图片失败 (localId=${msg.localId}): ${sourcePath}, code=${copied.code || 'UNKNOWN'} → 将显示 [图片] 占位符`)
+        }
+        return null
+      }
 
       return {
         relativePath: path.posix.join(mediaRelativePrefix, 'images', fileName),
@@ -2598,7 +2630,7 @@ class ExportService {
       // 使用 chatService 下载表情包 (利用其重试和 fallback 逻辑)
       const localPath = await chatService.downloadEmojiFile(msg)
 
-      if (!localPath || !(await this.pathExists(localPath))) {
+      if (!localPath) {
         return null
       }
 
@@ -2607,8 +2639,8 @@ class ExportService {
       const key = msg.emojiMd5 || String(msg.localId)
       const fileName = `${key}${ext}`
       const destPath = path.join(emojisDir, fileName)
-
-      await fs.promises.copyFile(localPath, destPath)
+      const copied = await this.copyFileOptimized(localPath, destPath)
+      if (!copied.success) return null
 
       return {
         relativePath: path.posix.join(mediaRelativePrefix, 'emojis', fileName),
@@ -2649,7 +2681,8 @@ class ExportService {
       const fileName = path.basename(sourcePath)
       const destPath = path.join(videosDir, fileName)
 
-      await fs.promises.copyFile(sourcePath, destPath)
+      const copied = await this.copyFileOptimized(sourcePath, destPath)
+      if (!copied.success) return null
 
       return {
         relativePath: path.posix.join(mediaRelativePrefix, 'videos', fileName),

@@ -1021,10 +1021,24 @@ function ChatPage(props: ChatPageProps) {
   const sessionWindowCacheRef = useRef<Map<string, SessionWindowCacheEntry>>(new Map())
   const previewPersistTimerRef = useRef<number | null>(null)
   const sessionListPersistTimerRef = useRef<number | null>(null)
+  const scrollBottomButtonArmTimerRef = useRef<number | null>(null)
+  const suppressScrollToBottomButtonRef = useRef(false)
   const pendingExportRequestIdRef = useRef<string | null>(null)
   const exportPrepareLongWaitTimerRef = useRef<number | null>(null)
   const jumpDatesRequestSeqRef = useRef(0)
   const jumpDateCountsRequestSeqRef = useRef(0)
+
+  const suppressScrollToBottomButton = useCallback((delayMs = 180) => {
+    suppressScrollToBottomButtonRef.current = true
+    if (scrollBottomButtonArmTimerRef.current !== null) {
+      window.clearTimeout(scrollBottomButtonArmTimerRef.current)
+      scrollBottomButtonArmTimerRef.current = null
+    }
+    scrollBottomButtonArmTimerRef.current = window.setTimeout(() => {
+      suppressScrollToBottomButtonRef.current = false
+      scrollBottomButtonArmTimerRef.current = null
+    }, delayMs)
+  }, [])
 
   const isGroupChatSession = useCallback((username: string) => {
     return username.includes('@chatroom')
@@ -2287,6 +2301,8 @@ function ChatPage(props: ChatPageProps) {
     setCurrentSession(null)
     setSessions([])
     setMessages([])
+    setShowScrollToBottom(false)
+    suppressScrollToBottomButton(260)
     setSearchKeyword('')
     setConnectionError(null)
     setConnected(false)
@@ -2311,6 +2327,7 @@ function ChatPage(props: ChatPageProps) {
     setSessionDetail,
     setShowDetailPanel,
     setShowGroupMembersPanel,
+    suppressScrollToBottomButton,
     setSessions
   ])
 
@@ -2350,7 +2367,9 @@ function ChatPage(props: ChatPageProps) {
     currentSessionRef.current = currentSessionId
     topRangeLoadLockRef.current = false
     bottomRangeLoadLockRef.current = false
-  }, [currentSessionId])
+    setShowScrollToBottom(false)
+    suppressScrollToBottomButton(260)
+  }, [currentSessionId, suppressScrollToBottomButton])
 
   const hydrateSessionStatuses = useCallback(async (sessionList: ChatSession[]) => {
     const usernames = sessionList.map((s) => s.username).filter(Boolean)
@@ -2820,6 +2839,8 @@ function ChatPage(props: ChatPageProps) {
 
 
     if (offset === 0) {
+      suppressScrollToBottomButton(260)
+      setShowScrollToBottom(false)
       setLoadingMessages(true)
       // 切会话时保留旧内容作为过渡，避免大面积闪烁
       setHasInitialMessages(true)
@@ -3903,10 +3924,6 @@ function ChatPage(props: ChatPageProps) {
       return
     }
 
-    const remaining = (total - 1) - range.endIndex
-    const shouldShowScrollButton = remaining > 3
-    setShowScrollToBottom(prev => (prev === shouldShowScrollButton ? prev : shouldShowScrollButton))
-
     if (
       range.startIndex <= 2 &&
       !topRangeLoadLockRef.current &&
@@ -3948,7 +3965,13 @@ function ChatPage(props: ChatPageProps) {
     if (!atBottom) {
       bottomRangeLoadLockRef.current = false
     }
-  }, [])
+    if (messages.length <= 0 || isLoadingMessages || isSessionSwitching || suppressScrollToBottomButtonRef.current) {
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+    const shouldShow = !atBottom
+    setShowScrollToBottom(prev => (prev === shouldShow ? prev : shouldShow))
+  }, [messages.length, isLoadingMessages, isSessionSwitching])
 
   const handleMessageAtTopStateChange = useCallback((atTop: boolean) => {
     if (!atTop) {
@@ -4028,22 +4051,24 @@ function ChatPage(props: ChatPageProps) {
 
   // 滚动到底部
   const scrollToBottom = useCallback(() => {
+    suppressScrollToBottomButton(220)
+    setShowScrollToBottom(false)
     const lastIndex = messages.length - 1
     if (lastIndex >= 0 && messageVirtuosoRef.current) {
       messageVirtuosoRef.current.scrollToIndex({
         index: lastIndex,
         align: 'end',
-        behavior: 'smooth'
+        behavior: 'auto'
       })
       return
     }
     if (messageListRef.current) {
       messageListRef.current.scrollTo({
         top: messageListRef.current.scrollHeight,
-        behavior: 'smooth'
+        behavior: 'auto'
       })
     }
-  }, [messages.length])
+  }, [messages.length, suppressScrollToBottomButton])
 
   // 拖动调节侧边栏宽度
   const handleResizeStart = useCallback((e: React.MouseEvent) => {
@@ -4085,6 +4110,10 @@ function ChatPage(props: ChatPageProps) {
       if (sessionListPersistTimerRef.current !== null) {
         window.clearTimeout(sessionListPersistTimerRef.current)
         sessionListPersistTimerRef.current = null
+      }
+      if (scrollBottomButtonArmTimerRef.current !== null) {
+        window.clearTimeout(scrollBottomButtonArmTimerRef.current)
+        scrollBottomButtonArmTimerRef.current = null
       }
       if (contactUpdateTimerRef.current) {
         clearTimeout(contactUpdateTimerRef.current)
@@ -5055,15 +5084,28 @@ function ChatPage(props: ChatPageProps) {
     return `${y}年${m}月${d}日`
   }, [])
 
+  const clampContextMenuPosition = useCallback((x: number, y: number) => {
+    const viewportPadding = 12
+    const estimatedMenuWidth = 180
+    const estimatedMenuHeight = 188
+    const maxLeft = Math.max(viewportPadding, window.innerWidth - estimatedMenuWidth - viewportPadding)
+    const maxTop = Math.max(viewportPadding, window.innerHeight - estimatedMenuHeight - viewportPadding)
+    return {
+      x: Math.min(Math.max(x, viewportPadding), maxLeft),
+      y: Math.min(Math.max(y, viewportPadding), maxTop)
+    }
+  }, [])
+
   // 消息右键菜单处理
   const handleContextMenu = useCallback((e: React.MouseEvent, message: Message) => {
     e.preventDefault()
+    const nextPos = clampContextMenuPosition(e.clientX, e.clientY)
     setContextMenu({
-      x: e.clientX,
-      y: e.clientY,
+      x: nextPos.x,
+      y: nextPos.y,
       message
     })
-  }, [])
+  }, [clampContextMenuPosition])
 
   // 关闭右键菜单
   useEffect(() => {
@@ -5916,6 +5958,8 @@ function ChatPage(props: ChatPageProps) {
                     customScrollParent={messageListScrollParent ?? undefined}
                     data={messages}
                     overscan={360}
+                    followOutput={(isAtBottom) => (isAtBottom ? 'auto' : false)}
+                    atBottomThreshold={80}
                     atBottomStateChange={handleMessageAtBottomStateChange}
                     atTopStateChange={handleMessageAtTopStateChange}
                     rangeChanged={handleMessageRangeChanged}
@@ -6464,14 +6508,16 @@ function ChatPage(props: ChatPageProps) {
       {contextMenu && createPortal(
         <>
           <div className="context-menu-overlay" onClick={() => setContextMenu(null)}
-            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9998 }} />
+            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 12040 }} />
           <div
             className="context-menu"
             style={{
               position: 'fixed',
               top: contextMenu.y,
               left: contextMenu.x,
-              zIndex: 9999
+              zIndex: 12050,
+              maxHeight: 'min(280px, calc(100vh - 24px))',
+              overflowY: 'auto'
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -6922,6 +6968,7 @@ function MessageBubble({
   const [imageInView, setImageInView] = useState(false)
   const imageForceHdAttempted = useRef<string | null>(null)
   const imageForceHdPending = useRef(false)
+  const imageDecryptPendingRef = useRef(false)
   const [imageLiveVideoPath, setImageLiveVideoPath] = useState<string | undefined>(undefined)
   const [voiceError, setVoiceError] = useState(false)
   const [voiceLoading, setVoiceLoading] = useState(false)
@@ -7115,7 +7162,8 @@ function MessageBubble({
 
   const requestImageDecrypt = useCallback(async (forceUpdate = false, silent = false) => {
     if (!isImage) return
-    if (imageLoading) return
+    if (imageLoading || imageDecryptPendingRef.current) return
+    imageDecryptPendingRef.current = true
     if (!silent) {
       setImageLoading(true)
       setImageError(false)
@@ -7151,6 +7199,7 @@ function MessageBubble({
       if (!silent) setImageError(true)
     } finally {
       if (!silent) setImageLoading(false)
+      imageDecryptPendingRef.current = false
     }
     return { success: false } as any
   }, [isImage, imageLoading, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64])
@@ -7341,19 +7390,6 @@ function MessageBubble({
     imageAutoHdTriggered.current = imageCacheKey
     triggerForceHd()
   }, [isImage, imageHasUpdate, imageInView, imageCacheKey, triggerForceHd])
-
-  useEffect(() => {
-    if (!isImage || !imageHasUpdate) return
-    if (imageAutoHdTriggered.current === imageCacheKey) return
-    imageAutoHdTriggered.current = imageCacheKey
-    triggerForceHd()
-  }, [isImage, imageHasUpdate, imageCacheKey, triggerForceHd])
-
-  // 更激进：进入视野/打开预览时，无论 hasUpdate 与否都尝试强制高清
-  useEffect(() => {
-    if (!isImage || !imageInView) return
-    triggerForceHd()
-  }, [isImage, imageInView, triggerForceHd])
 
 
   useEffect(() => {

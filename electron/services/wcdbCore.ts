@@ -87,7 +87,9 @@ export class WcdbCore {
   private wcdbGetMessageTableColumns: any = null
   private wcdbGetMessageTableTimeRange: any = null
   private wcdbResolveImageHardlink: any = null
+  private wcdbResolveImageHardlinkBatch: any = null
   private wcdbResolveVideoHardlinkMd5: any = null
+  private wcdbResolveVideoHardlinkMd5Batch: any = null
   private wcdbInstallSnsBlockDeleteTrigger: any = null
   private wcdbUninstallSnsBlockDeleteTrigger: any = null
   private wcdbCheckSnsBlockDeleteTrigger: any = null
@@ -111,6 +113,7 @@ export class WcdbCore {
   private imageHardlinkCache: Map<string, { result: { success: boolean; data?: any; error?: string }; updatedAt: number }> = new Map()
   private videoHardlinkCache: Map<string, { result: { success: boolean; data?: any; error?: string }; updatedAt: number }> = new Map()
   private readonly hardlinkCacheTtlMs = 10 * 60 * 1000
+  private readonly hardlinkCacheMaxEntries = 20000
   private logTimer: NodeJS.Timeout | null = null
   private lastLogTail: string | null = null
   private lastResolvedLogPath: string | null = null
@@ -963,9 +966,19 @@ export class WcdbCore {
         this.wcdbResolveImageHardlink = null
       }
       try {
+        this.wcdbResolveImageHardlinkBatch = this.lib.func('int32 wcdb_resolve_image_hardlink_batch(int64 handle, const char* requestsJson, _Out_ void** outJson)')
+      } catch {
+        this.wcdbResolveImageHardlinkBatch = null
+      }
+      try {
         this.wcdbResolveVideoHardlinkMd5 = this.lib.func('int32 wcdb_resolve_video_hardlink_md5(int64 handle, const char* md5, const char* dbPath, _Out_ void** outJson)')
       } catch {
         this.wcdbResolveVideoHardlinkMd5 = null
+      }
+      try {
+        this.wcdbResolveVideoHardlinkMd5Batch = this.lib.func('int32 wcdb_resolve_video_hardlink_md5_batch(int64 handle, const char* requestsJson, _Out_ void** outJson)')
+      } catch {
+        this.wcdbResolveVideoHardlinkMd5Batch = null
       }
 
       // wcdb_status wcdb_install_sns_block_delete_trigger(wcdb_handle handle, char** out_error)
@@ -1312,6 +1325,20 @@ export class WcdbCore {
       result: this.cloneHardlinkResult(result),
       updatedAt: Date.now()
     })
+    if (cache.size <= this.hardlinkCacheMaxEntries) return
+
+    const now = Date.now()
+    for (const [cacheKey, entry] of cache) {
+      if (now - entry.updatedAt > this.hardlinkCacheTtlMs) {
+        cache.delete(cacheKey)
+      }
+    }
+
+    while (cache.size > this.hardlinkCacheMaxEntries) {
+      const oldestKey = cache.keys().next().value as string | undefined
+      if (!oldestKey) break
+      cache.delete(oldestKey)
+    }
   }
 
   private cloneHardlinkResult(result: { success: boolean; data?: any; error?: string }): { success: boolean; data?: any; error?: string } {
@@ -2853,22 +2880,98 @@ export class WcdbCore {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
     if (!Array.isArray(requests)) return { success: false, error: '参数错误: requests 必须是数组' }
     try {
-      const rows: Array<{ index: number; md5: string; success: boolean; data?: any; error?: string }> = []
-      for (let i = 0; i < requests.length; i += 1) {
-        const req = requests[i] || { md5: '' }
-        const normalizedMd5 = String(req.md5 || '').trim().toLowerCase()
-        if (!normalizedMd5) {
-          rows.push({ index: i, md5: '', success: false, error: 'md5 为空' })
+      const normalizedRequests = requests.map((req) => ({
+        md5: String(req?.md5 || '').trim().toLowerCase(),
+        accountDir: String(req?.accountDir || '').trim()
+      }))
+      const rows: Array<{ index: number; md5: string; success: boolean; data?: any; error?: string }> = new Array(normalizedRequests.length)
+      const unresolved: Array<{ index: number; md5: string; accountDir: string }> = []
+
+      for (let i = 0; i < normalizedRequests.length; i += 1) {
+        const req = normalizedRequests[i]
+        if (!req.md5) {
+          rows[i] = { index: i, md5: '', success: false, error: 'md5 为空' }
           continue
         }
-        const result = await this.resolveImageHardlink(normalizedMd5, req.accountDir)
-        rows.push({
-          index: i,
-          md5: normalizedMd5,
+        const cacheKey = this.makeHardlinkCacheKey(req.md5, req.accountDir)
+        const cached = this.readHardlinkCache(this.imageHardlinkCache, cacheKey)
+        if (cached) {
+          rows[i] = {
+            index: i,
+            md5: req.md5,
+            success: cached.success === true,
+            data: cached.data,
+            error: cached.error
+          }
+        } else {
+          unresolved.push({ index: i, md5: req.md5, accountDir: req.accountDir })
+        }
+      }
+
+      if (unresolved.length === 0) {
+        return { success: true, rows }
+      }
+
+      if (this.wcdbResolveImageHardlinkBatch) {
+        try {
+          const outPtr = [null as any]
+          const payload = JSON.stringify(unresolved.map((req) => ({
+            md5: req.md5,
+            account_dir: req.accountDir || undefined
+          })))
+          const result = this.wcdbResolveImageHardlinkBatch(this.handle, payload, outPtr)
+          if (result === 0 && outPtr[0]) {
+            const jsonStr = this.decodeJsonPtr(outPtr[0])
+            if (jsonStr) {
+              const nativeRows = JSON.parse(jsonStr)
+              const mappedRows = Array.isArray(nativeRows) ? nativeRows.map((row: any, index: number) => {
+                const rowIndexRaw = Number(row?.index)
+                const rowIndex = Number.isFinite(rowIndexRaw) ? Math.floor(rowIndexRaw) : index
+                const fallbackReq = rowIndex >= 0 && rowIndex < unresolved.length ? unresolved[rowIndex] : { md5: '', accountDir: '', index: -1 }
+                const rowMd5 = String(row?.md5 || fallbackReq.md5 || '').trim().toLowerCase()
+                const success = row?.success === true || row?.success === 1 || row?.success === '1'
+                const data = row?.data && typeof row.data === 'object' ? row.data : {}
+                const error = row?.error ? String(row.error) : undefined
+                if (success && rowMd5) {
+                  const cacheKey = this.makeHardlinkCacheKey(rowMd5, fallbackReq.accountDir)
+                  this.writeHardlinkCache(this.imageHardlinkCache, cacheKey, { success: true, data })
+                }
+                return {
+                  index: rowIndex,
+                  md5: rowMd5,
+                  success,
+                  data,
+                  error
+                }
+              }) : []
+              for (const row of mappedRows) {
+                const fallbackReq = row.index >= 0 && row.index < unresolved.length ? unresolved[row.index] : null
+                if (!fallbackReq) continue
+                rows[fallbackReq.index] = {
+                  index: fallbackReq.index,
+                  md5: row.md5 || fallbackReq.md5,
+                  success: row.success,
+                  data: row.data,
+                  error: row.error
+                }
+              }
+            }
+          }
+        } catch {
+          // 回退到单条循环实现
+        }
+      }
+
+      for (const req of unresolved) {
+        if (rows[req.index]) continue
+        const result = await this.resolveImageHardlink(req.md5, req.accountDir)
+        rows[req.index] = {
+          index: req.index,
+          md5: req.md5,
           success: result.success === true,
           data: result.data,
           error: result.error
-        })
+        }
       }
       return { success: true, rows }
     } catch (e) {
@@ -2882,22 +2985,98 @@ export class WcdbCore {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
     if (!Array.isArray(requests)) return { success: false, error: '参数错误: requests 必须是数组' }
     try {
-      const rows: Array<{ index: number; md5: string; success: boolean; data?: any; error?: string }> = []
-      for (let i = 0; i < requests.length; i += 1) {
-        const req = requests[i] || { md5: '' }
-        const normalizedMd5 = String(req.md5 || '').trim().toLowerCase()
-        if (!normalizedMd5) {
-          rows.push({ index: i, md5: '', success: false, error: 'md5 为空' })
+      const normalizedRequests = requests.map((req) => ({
+        md5: String(req?.md5 || '').trim().toLowerCase(),
+        dbPath: String(req?.dbPath || '').trim()
+      }))
+      const rows: Array<{ index: number; md5: string; success: boolean; data?: any; error?: string }> = new Array(normalizedRequests.length)
+      const unresolved: Array<{ index: number; md5: string; dbPath: string }> = []
+
+      for (let i = 0; i < normalizedRequests.length; i += 1) {
+        const req = normalizedRequests[i]
+        if (!req.md5) {
+          rows[i] = { index: i, md5: '', success: false, error: 'md5 为空' }
           continue
         }
-        const result = await this.resolveVideoHardlinkMd5(normalizedMd5, req.dbPath)
-        rows.push({
-          index: i,
-          md5: normalizedMd5,
+        const cacheKey = this.makeHardlinkCacheKey(req.md5, req.dbPath)
+        const cached = this.readHardlinkCache(this.videoHardlinkCache, cacheKey)
+        if (cached) {
+          rows[i] = {
+            index: i,
+            md5: req.md5,
+            success: cached.success === true,
+            data: cached.data,
+            error: cached.error
+          }
+        } else {
+          unresolved.push({ index: i, md5: req.md5, dbPath: req.dbPath })
+        }
+      }
+
+      if (unresolved.length === 0) {
+        return { success: true, rows }
+      }
+
+      if (this.wcdbResolveVideoHardlinkMd5Batch) {
+        try {
+          const outPtr = [null as any]
+          const payload = JSON.stringify(unresolved.map((req) => ({
+            md5: req.md5,
+            db_path: req.dbPath || undefined
+          })))
+          const result = this.wcdbResolveVideoHardlinkMd5Batch(this.handle, payload, outPtr)
+          if (result === 0 && outPtr[0]) {
+            const jsonStr = this.decodeJsonPtr(outPtr[0])
+            if (jsonStr) {
+              const nativeRows = JSON.parse(jsonStr)
+              const mappedRows = Array.isArray(nativeRows) ? nativeRows.map((row: any, index: number) => {
+                const rowIndexRaw = Number(row?.index)
+                const rowIndex = Number.isFinite(rowIndexRaw) ? Math.floor(rowIndexRaw) : index
+                const fallbackReq = rowIndex >= 0 && rowIndex < unresolved.length ? unresolved[rowIndex] : { md5: '', dbPath: '', index: -1 }
+                const rowMd5 = String(row?.md5 || fallbackReq.md5 || '').trim().toLowerCase()
+                const success = row?.success === true || row?.success === 1 || row?.success === '1'
+                const data = row?.data && typeof row.data === 'object' ? row.data : {}
+                const error = row?.error ? String(row.error) : undefined
+                if (success && rowMd5) {
+                  const cacheKey = this.makeHardlinkCacheKey(rowMd5, fallbackReq.dbPath)
+                  this.writeHardlinkCache(this.videoHardlinkCache, cacheKey, { success: true, data })
+                }
+                return {
+                  index: rowIndex,
+                  md5: rowMd5,
+                  success,
+                  data,
+                  error
+                }
+              }) : []
+              for (const row of mappedRows) {
+                const fallbackReq = row.index >= 0 && row.index < unresolved.length ? unresolved[row.index] : null
+                if (!fallbackReq) continue
+                rows[fallbackReq.index] = {
+                  index: fallbackReq.index,
+                  md5: row.md5 || fallbackReq.md5,
+                  success: row.success,
+                  data: row.data,
+                  error: row.error
+                }
+              }
+            }
+          }
+        } catch {
+          // 回退到单条循环实现
+        }
+      }
+
+      for (const req of unresolved) {
+        if (rows[req.index]) continue
+        const result = await this.resolveVideoHardlinkMd5(req.md5, req.dbPath)
+        rows[req.index] = {
+          index: req.index,
+          md5: req.md5,
           success: result.success === true,
           data: result.data,
           error: result.error
-        })
+        }
       }
       return { success: true, rows }
     } catch (e) {

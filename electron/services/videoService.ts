@@ -162,21 +162,22 @@ class VideoService {
       new Set((md5List || []).map((item) => String(item || '').trim().toLowerCase()).filter(Boolean))
     )
     const resolvedMap = new Map<string, string>()
-    let unresolved = [...normalizedList]
+    const unresolvedSet = new Set(normalizedList)
 
     for (const md5 of normalizedList) {
       const cacheKey = `${scopeKey}|${md5}`
       const cached = this.readTimedCache(this.hardlinkResolveCache, cacheKey)
       if (cached === undefined) continue
       if (cached) resolvedMap.set(md5, cached)
-      unresolved = unresolved.filter((item) => item !== md5)
+      unresolvedSet.delete(md5)
     }
 
-    if (unresolved.length === 0) return resolvedMap
+    if (unresolvedSet.size === 0) return resolvedMap
 
     const encryptedDbPaths = this.getHardlinkDbPaths(dbPath, wxid, cleanedWxid)
     for (const p of encryptedDbPaths) {
-      if (!existsSync(p) || unresolved.length === 0) continue
+      if (!existsSync(p) || unresolvedSet.size === 0) continue
+      const unresolved = Array.from(unresolvedSet)
       const requests = unresolved.map((md5) => ({ md5, dbPath: p }))
       try {
         const batchResult = await wcdbService.resolveVideoHardlinkMd5Batch(requests)
@@ -194,6 +195,7 @@ class VideoService {
             const cacheKey = `${scopeKey}|${inputMd5}`
             this.writeTimedCache(this.hardlinkResolveCache, cacheKey, resolvedMd5, this.hardlinkCacheTtlMs, this.maxCacheEntries)
             resolvedMap.set(inputMd5, resolvedMd5)
+            unresolvedSet.delete(inputMd5)
           }
         } else {
           // 兼容不支持批量接口的版本，回退单条请求。
@@ -207,17 +209,16 @@ class VideoService {
               const cacheKey = `${scopeKey}|${req.md5}`
               this.writeTimedCache(this.hardlinkResolveCache, cacheKey, resolvedMd5, this.hardlinkCacheTtlMs, this.maxCacheEntries)
               resolvedMap.set(req.md5, resolvedMd5)
+              unresolvedSet.delete(req.md5)
             } catch { }
           }
         }
       } catch (e) {
         this.log('resolveVideoHardlinks 批量查询失败', { path: p, error: String(e) })
       }
-
-      unresolved = unresolved.filter((md5) => !resolvedMap.has(md5))
     }
 
-    for (const md5 of unresolved) {
+    for (const md5 of unresolvedSet) {
       const cacheKey = `${scopeKey}|${md5}`
       this.writeTimedCache(this.hardlinkResolveCache, cacheKey, null, this.hardlinkCacheTtlMs, this.maxCacheEntries)
     }
