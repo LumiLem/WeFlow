@@ -188,5 +188,10 @@
       }
     ],
     "icon": "resources/icon.icns"
+  },
+  "overrides": {
+    "picomatch": "^4.0.4",
+    "tar": "^7.5.13",
+    "immutable": "^5.1.5"
   }
 }
