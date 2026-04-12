@@ -1,11 +1,12 @@
-﻿import https from 'https'
+import https from 'https'
 import { createHash } from 'crypto'
 import { URL } from 'url'
 
 const WEIBO_TIMEOUT_MS = 10_000
 const WEIBO_MAX_POSTS = 5
 const WEIBO_CACHE_TTL_MS = 30 * 60 * 1000
-const WEIBO_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+const WEIBO_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
 
 interface BrowserCookieEntry {
   domain?: string
@@ -66,44 +67,50 @@ function requestJson<T>(url: string, options: { cookie: string; referer?: string
     try {
       urlObj = new URL(url)
     } catch {
-      reject(new Error(无效的微博请求地址：))
+      reject(new Error(`无效的微博请求地址：${url}`))
       return
     }
 
-    const req = https.request({
-      hostname: urlObj.hostname,
-      port: urlObj.port || 443,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        Accept: 'application/json, text/plain, */*',
-        Referer: options.referer || 'https://weibo.com',
-        'User-Agent': WEIBO_USER_AGENT,
-        'X-Requested-With': 'XMLHttpRequest',
-        Cookie: options.cookie
+    const req = https.request(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port || 443,
+        path: urlObj.pathname + urlObj.search,
+        method: 'GET',
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Referer: options.referer || 'https://weibo.com',
+          'User-Agent': WEIBO_USER_AGENT,
+          'X-Requested-With': 'XMLHttpRequest',
+          Cookie: options.cookie
+        }
+      },
+      (res) => {
+        let raw = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          raw += chunk
+        })
+        res.on('end', () => {
+          const statusCode = res.statusCode || 0
+          if (statusCode < 200 || statusCode >= 300) {
+            reject(new Error(`微博接口返回异常状态码 ${statusCode}`))
+            return
+          }
+          try {
+            resolve(JSON.parse(raw) as T)
+          } catch {
+            reject(new Error('微博接口返回了非 JSON 响应'))
+          }
+        })
       }
-    }, (res) => {
-      let raw = ''
-      res.setEncoding('utf8')
-      res.on('data', (chunk) => { raw += chunk })
-      res.on('end', () => {
-        const statusCode = res.statusCode || 0
-        if (statusCode < 200 || statusCode >= 300) {
-          reject(new Error(微博接口返回异常状态码 ))
-          return
-        }
-        try {
-          resolve(JSON.parse(raw) as T)
-        } catch {
-          reject(new Error('微博接口返回了非 JSON 响应'))
-        }
-      })
-    })
+    )
 
     req.setTimeout(WEIBO_TIMEOUT_MS, () => {
       req.destroy()
       reject(new Error('微博请求超时'))
     })
+
     req.on('error', reject)
     req.end()
   })
@@ -111,15 +118,21 @@ function requestJson<T>(url: string, options: { cookie: string; referer?: string
 
 function normalizeCookieArray(entries: BrowserCookieEntry[]): string {
   const picked = new Map<string, string>()
+
   for (const entry of entries) {
     const name = String(entry?.name || '').trim()
     const value = String(entry?.value || '').trim()
     const domain = String(entry?.domain || '').trim().toLowerCase()
+
     if (!name || !value) continue
     if (domain && !domain.includes('weibo.com') && !domain.includes('weibo.cn')) continue
+
     picked.set(name, value)
   }
-  return Array.from(picked.entries()).map(([name, value]) => ${name}=).join('; ')
+
+  return Array.from(picked.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ')
 }
 
 export function normalizeWeiboCookieInput(rawInput: string): string {
@@ -134,7 +147,9 @@ export function normalizeWeiboCookieInput(rawInput: string): string {
       throw new Error('Cookie JSON 中未找到可用的微博 Cookie 项')
     }
   } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error
+    if (!(error instanceof SyntaxError)) {
+      throw error
+    }
   }
 
   return trimmed.replace(/^Cookie:\s*/i, '').trim()
@@ -164,13 +179,13 @@ function mergeRetweetText(item: Pick<WeiboWaterFallItem, 'text_raw' | 'retweeted
   const baseText = sanitizeWeiboText(item.text_raw || '')
   const retweetText = sanitizeWeiboText(item.retweeted_status?.text_raw || '')
   if (!retweetText) return baseText
-  if (!baseText || baseText === '转发微博') return 转发：
-  return ${baseText}\n\n转发内容：
+  if (!baseText || baseText === '转发微博') return `转发：${retweetText}`
+  return `${baseText}\n\n转发内容：${retweetText}`
 }
 
 function buildCacheKey(uid: string, count: number, cookie: string): string {
   const cookieHash = createHash('sha1').update(cookie).digest('hex')
-  return ${uid}::
+  return `${uid}:${count}:${cookieHash}`
 }
 
 class WeiboService {
@@ -180,25 +195,41 @@ class WeiboService {
     this.recentPostsCache.clear()
   }
 
-  async validateUid(uidInput: string, cookieInput: string): Promise<{ success: boolean; uid?: string; screenName?: string; error?: string }> {
+  async validateUid(
+    uidInput: string,
+    cookieInput: string
+  ): Promise<{ success: boolean; uid?: string; screenName?: string; error?: string }> {
     try {
       const uid = normalizeWeiboUid(uidInput)
       const cookie = normalizeWeiboCookieInput(cookieInput)
-      if (!cookie) return { success: false, error: '请先填写有效的微博 Cookie' }
+      if (!cookie) {
+        return { success: false, error: '请先填写有效的微博 Cookie' }
+      }
 
       const timeline = await this.fetchTimeline(uid, cookie)
       const firstItem = timeline.data?.list?.[0]
       if (!firstItem) {
         return { success: false, error: '该微博账号暂无可读取的近期公开内容，或当前 Cookie 已失效' }
       }
-      const screenName = firstItem.user?.screen_name
-      return { success: true, uid, screenName }
+
+      return {
+        success: true,
+        uid,
+        screenName: firstItem.user?.screen_name
+      }
     } catch (error) {
-      return { success: false, error: (error as Error).message || '微博 UID 校验失败' }
+      return {
+        success: false,
+        error: (error as Error).message || '微博 UID 校验失败'
+      }
     }
   }
 
-  async fetchRecentPosts(uidInput: string, cookieInput: string, requestedCount: number): Promise<WeiboRecentPost[]> {
+  async fetchRecentPosts(
+    uidInput: string,
+    cookieInput: string,
+    requestedCount: number
+  ): Promise<WeiboRecentPost[]> {
     const uid = normalizeWeiboUid(uidInput)
     const cookie = normalizeWeiboCookieInput(cookieInput)
     if (!cookie) return []
@@ -207,7 +238,10 @@ class WeiboService {
     const cacheKey = buildCacheKey(uid, count, cookie)
     const cached = this.recentPostsCache.get(cacheKey)
     const now = Date.now()
-    if (cached && cached.expiresAt > now) return cached.posts
+
+    if (cached && cached.expiresAt > now) {
+      return cached.posts
+    }
 
     const timeline = await this.fetchTimeline(uid, cookie)
     const rawItems = Array.isArray(timeline.data?.list) ? timeline.data.list : []
@@ -215,6 +249,7 @@ class WeiboService {
 
     for (const item of rawItems) {
       if (posts.length >= count) break
+
       const id = String(item.idstr || item.id || '').trim()
       if (!id) continue
 
@@ -224,15 +259,17 @@ class WeiboService {
           const detail = await this.fetchDetail(id, cookie)
           text = mergeRetweetText(detail)
         } catch {
+          // 长文补抓失败时回退到列表摘要
         }
       }
+
       text = sanitizeWeiboText(text)
       if (!text) continue
 
       posts.push({
         id,
         createdAt: String(item.created_at || ''),
-        url: https://m.weibo.cn/detail/,
+        url: `https://m.weibo.cn/detail/${id}`,
         text,
         screenName: item.user?.screen_name
       })
@@ -242,13 +279,17 @@ class WeiboService {
       expiresAt: now + WEIBO_CACHE_TTL_MS,
       posts
     })
+
     return posts
   }
 
   private fetchTimeline(uid: string, cookie: string): Promise<WeiboWaterFallResponse> {
     return requestJson<WeiboWaterFallResponse>(
-      https://weibo.com/ajax/profile/getWaterFallContent?uid=,
-      { cookie, referer: https://weibo.com/u/ }
+      `https://weibo.com/ajax/profile/getWaterFallContent?uid=${encodeURIComponent(uid)}`,
+      {
+        cookie,
+        referer: `https://weibo.com/u/${encodeURIComponent(uid)}`
+      }
     ).then((response) => {
       if (response.ok !== 1 || !Array.isArray(response.data?.list)) {
         throw new Error('微博时间线获取失败，请检查 Cookie 是否仍然有效')
@@ -259,8 +300,11 @@ class WeiboService {
 
   private fetchDetail(id: string, cookie: string): Promise<WeiboStatusShowResponse> {
     return requestJson<WeiboStatusShowResponse>(
-      https://weibo.com/ajax/statuses/show?id=&isGetLongText=true,
-      { cookie, referer: https://weibo.com/detail/ }
+      `https://weibo.com/ajax/statuses/show?id=${encodeURIComponent(id)}&isGetLongText=true`,
+      {
+        cookie,
+        referer: `https://weibo.com/detail/${encodeURIComponent(id)}`
+      }
     ).then((response) => {
       if (!response || (!response.id && !response.idstr)) {
         throw new Error('微博详情获取失败')
