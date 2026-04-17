@@ -505,26 +505,42 @@ export interface ElectronAPI {
   }
 
   image: {
-    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string }>
+    decrypt: (payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      createTime?: number
+      force?: boolean
+      preferFilePath?: boolean
+      hardlinkOnly?: boolean
+      disableUpdateCheck?: boolean
+      allowCacheIndex?: boolean
+      suppressEvents?: boolean
+    }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string; failureKind?: 'not_found' | 'decrypt_failed' }>
     resolveCache: (payload: {
       sessionId?: string
       imageMd5?: string
       imageDatName?: string
+      createTime?: number
+      preferFilePath?: boolean
+      hardlinkOnly?: boolean
       disableUpdateCheck?: boolean
       allowCacheIndex?: boolean
-    }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }>
+      suppressEvents?: boolean
+    }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string; failureKind?: 'not_found' | 'decrypt_failed' }>
     resolveCacheBatch: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; preferFilePath?: boolean; hardlinkOnly?: boolean }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean; preferFilePath?: boolean; hardlinkOnly?: boolean; suppressEvents?: boolean }
     ) => Promise<{
       success: boolean
-      rows?: Array<{ success: boolean; localPath?: string; hasUpdate?: boolean; error?: string }>
+      rows?: Array<{ success: boolean; localPath?: string; hasUpdate?: boolean; error?: string; failureKind?: 'not_found' | 'decrypt_failed' }>
       error?: string
     }>
     preload: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }>,
       options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => Promise<boolean>
+    preloadHardlinkMd5s: (md5List: string[]) => Promise<boolean>
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => () => void
     onCacheResolved: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string; localPath: string }) => void) => () => void
     onDecryptProgress: (callback: (payload: {
@@ -1135,7 +1151,6 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
-  imageDeepSearchOnMiss?: boolean
 }
 
 export interface ExportProgress {
